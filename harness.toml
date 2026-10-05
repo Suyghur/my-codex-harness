@@ -1,0 +1,29 @@
+schema_version = 1
+name = "my-codex-harness"
+version = "0.1.0"
+
+# 这是资产清单和路由提示，不是 Codex 的权限配置。
+[roles.explorer]
+file = "agents/explorer.toml"
+modes = ["explore"]
+access = "read-only"
+
+[roles.librarian]
+file = "agents/librarian.toml"
+modes = ["research"]
+access = "read-only-with-scratch"
+
+[roles.plan]
+file = "agents/plan.toml"
+modes = ["explore", "diagnose", "propose", "update"]
+access = "planning-artifacts"
+
+[roles.worker]
+file = "agents/worker.toml"
+modes = ["implement", "qa", "sync", "archive"]
+access = "task-scoped"
+
+[roles.reviewer]
+file = "agents/reviewer.toml"
+modes = ["plan-review", "code-review", "verify"]
+access = "read-only-with-report"
