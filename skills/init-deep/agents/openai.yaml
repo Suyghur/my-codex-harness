@@ -1,0 +1,4 @@
+interface:
+  display_name: "Init Deep"
+  short_description: "调查仓库实现与局部约定，创建或更新简洁、可核实的分层 AGENTS.md"
+  default_prompt: "使用 $init-deep 调查当前仓库，保留已有约定并更新分层 AGENTS.md。"

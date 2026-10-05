@@ -1,0 +1,26 @@
+[package]
+name = "my-codex-harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "检查和部署本地 Codex 角色资产"
+license = "MIT"
+
+[[bin]]
+name = "my-codex-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
