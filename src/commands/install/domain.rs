@@ -1,4 +1,8 @@
 //! Read-only planning followed by all backups, then individual atomic replacements.
+use crate::shared::{
+    paths::physical_directory,
+    role_name::{portable_name_key, validate_role_name},
+};
 use anyhow::{Context, Result, bail};
 use std::{
     fs::{self, File, OpenOptions},
@@ -20,35 +24,22 @@ struct Target {
     destination: PathBuf,
     action: Action,
 }
+
+/// Completed actions and preview entries, formatted only by the command layer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallationEvent {
+    Installed(String),
+    Preview {
+        destination: PathBuf,
+        source: PathBuf,
+    },
+    BackupCreated(PathBuf),
+}
 #[derive(Debug)]
 pub struct InstallationPlan {
     home: PathBuf,
     agents: PathBuf,
     targets: Vec<Target>,
-}
-
-// Follow existing directory links, but reject dangling links and non-directory ancestors.
-fn inspect_directory(path: &Path) -> Result<()> {
-    for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        match fs::symlink_metadata(ancestor) {
-            Ok(_) => {
-                if !fs::metadata(ancestor)
-                    .with_context(|| format!("无法解析目录 {}", ancestor.display()))?
-                    .is_dir()
-                {
-                    bail!("目录路径不可用：{}", ancestor.display());
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("无法检查目录 {}", ancestor.display()));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn link(source: &Path, destination: &Path) -> Result<()> {
@@ -65,7 +56,12 @@ fn link(source: &Path, destination: &Path) -> Result<()> {
 }
 
 impl InstallationPlan {
-    pub fn prepare(home: &Path, sources: &[(String, PathBuf)]) -> Result<Self> {
+    pub fn prepare(
+        home: &Path,
+        sources: &[(String, PathBuf)],
+        source_directory: &Path,
+        manifests: &[PathBuf],
+    ) -> Result<Self> {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             bail!("安装仅支持 macOS/Linux");
         }
@@ -74,20 +70,15 @@ impl InstallationPlan {
         } else {
             std::env::current_dir()?.join(home)
         };
-        let agents = home.join("agents");
-        inspect_directory(&agents)?;
+        let home = physical_directory(&home)?;
+        let agents = physical_directory(&home.join("agents"))?;
+        let source_directory = fs::canonicalize(source_directory)?;
         let mut targets = Vec::with_capacity(sources.len());
         let mut names = std::collections::HashSet::new();
         for (name, source) in sources {
-            if name.is_empty()
-                || Path::new(name).components().count() != 1
-                || name == "."
-                || name == ".."
-                || name.contains('/')
-                || name.contains('\\')
-                || !names.insert(name)
-            {
-                bail!("非法或重复角色名称：{name}");
+            validate_role_name(name)?;
+            if !names.insert(portable_name_key(name)) {
+                bail!("角色目标名称发生大小写碰撞：{name}");
             }
             let source = fs::canonicalize(source)
                 .with_context(|| format!("无法解析角色源文件 {}", source.display()))?;
@@ -95,6 +86,13 @@ impl InstallationPlan {
                 bail!("角色源不是普通文件：{}", source.display());
             }
             let destination = agents.join(format!("{name}.toml"));
+            // Protect the manifest entry as well as its resolved source. A
+            // target symlink elsewhere can still be backed up and replaced.
+            let entry = fs::symlink_metadata(&destination)
+                .ok()
+                .filter(|m| !m.file_type().is_symlink())
+                .and_then(|_| fs::canonicalize(&destination).ok())
+                .unwrap_or_else(|| destination.clone());
             let action = match fs::symlink_metadata(&destination) {
                 Ok(metadata) => {
                     if !metadata.is_file() && !metadata.file_type().is_symlink() {
@@ -114,6 +112,13 @@ impl InstallationPlan {
                         .with_context(|| format!("无法检查角色目标 {}", destination.display()));
                 }
             };
+            if !matches!(action, Action::Skip)
+                && manifests
+                    .iter()
+                    .any(|manifest| *manifest == destination || *manifest == entry)
+            {
+                bail!("安装目标与资产清单重叠：{}", destination.display());
+            }
             targets.push(Target {
                 name: name.clone(),
                 source,
@@ -125,7 +130,15 @@ impl InstallationPlan {
             .iter()
             .any(|t| matches!(t.action, Action::BackupFile | Action::BackupLink(_)))
         {
-            inspect_directory(&home.join("backups/my-codex-harness"))?;
+            let backup_root = home.join("backups/my-codex-harness");
+            if physical_directory(&backup_root)?.starts_with(&source_directory) {
+                bail!("备份目录位于源资产目录内");
+            }
+        }
+        if targets.iter().any(|t| !matches!(t.action, Action::Skip))
+            && agents.starts_with(&source_directory)
+        {
+            bail!("安装写入目录位于源资产目录内：{}", agents.display());
         }
         Ok(Self {
             home,
@@ -134,27 +147,25 @@ impl InstallationPlan {
         })
     }
 
-    pub fn execute(self, dry_run: bool, output: &mut dyn Write) -> Result<()> {
-        self.execute_with(dry_run, output, |_, _| Ok(()))
+    pub fn execute(self, dry_run: bool, events: &mut Vec<InstallationEvent>) -> Result<()> {
+        self.execute_with(dry_run, events, |_, _| Ok(()))
     }
 
     fn execute_with(
         self,
         dry_run: bool,
-        output: &mut dyn Write,
+        events: &mut Vec<InstallationEvent>,
         mut before: impl FnMut(Stage, usize) -> Result<()>,
     ) -> Result<()> {
         if dry_run {
             for target in &self.targets {
                 if matches!(target.action, Action::Skip) {
-                    writeln!(output, "已安装：{}", target.name)?;
+                    events.push(InstallationEvent::Installed(target.name.clone()));
                 } else {
-                    writeln!(
-                        output,
-                        "预览：{} -> {}",
-                        target.destination.display(),
-                        target.source.display()
-                    )?;
+                    events.push(InstallationEvent::Preview {
+                        destination: target.destination.clone(),
+                        source: target.source.clone(),
+                    });
                 }
             }
             return Ok(());
@@ -165,7 +176,7 @@ impl InstallationPlan {
             .all(|t| matches!(t.action, Action::Skip))
         {
             for target in &self.targets {
-                writeln!(output, "已安装：{}", target.name)?;
+                events.push(InstallationEvent::Installed(target.name.clone()));
             }
             return Ok(());
         }
@@ -183,6 +194,7 @@ impl InstallationPlan {
                 .prefix("agents-")
                 .tempdir_in(&backup_root)?
                 .keep();
+            events.push(InstallationEvent::BackupCreated(backup.clone()));
             for (index, target) in conflicts.iter().enumerate() {
                 before(Stage::Backup, index)?;
                 let destination = backup.join(format!("{}.toml", target.name));
@@ -203,7 +215,6 @@ impl InstallationPlan {
                     _ => unreachable!(),
                 }
             }
-            writeln!(output, "备份：{}", backup.display())?;
         }
         let temporary = tempfile::Builder::new()
             .prefix(".harness-install-")
@@ -219,7 +230,7 @@ impl InstallationPlan {
             before(Stage::Replace, index)?;
             fs::rename(&staged, &target.destination)
                 .with_context(|| format!("无法替换角色 {}", target.name))?;
-            writeln!(output, "已安装：{}", target.name)?;
+            events.push(InstallationEvent::Installed(target.name.clone()));
         }
         Ok(())
     }
@@ -232,10 +243,14 @@ enum Stage {
 }
 
 pub fn check_links(home: &Path, sources: &[(String, PathBuf)]) -> Vec<String> {
+    let agents = match physical_directory(&home.join("agents")) {
+        Ok(agents) => agents,
+        Err(error) => return vec![format!("{error:#}")],
+    };
     sources
         .iter()
         .filter_map(|(name, source)| {
-            let target = home.join("agents").join(format!("{name}.toml"));
+            let target = agents.join(format!("{name}.toml"));
             match (fs::canonicalize(source), fs::canonicalize(&target)) {
                 (Ok(source), Ok(target)) if source == target => None,
                 _ => Some(format!(
@@ -251,6 +266,9 @@ pub fn check_links(home: &Path, sources: &[(String, PathBuf)]) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    fn prepare(home: &Path, sources: &[(String, PathBuf)]) -> Result<InstallationPlan> {
+        InstallationPlan::prepare(home, sources, sources[0].1.parent().unwrap(), &[])
+    }
     fn fixture() -> (tempfile::TempDir, PathBuf, Vec<(String, PathBuf)>) {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
@@ -278,13 +296,13 @@ mod tests {
     #[test]
     fn previews_do_not_create_or_modify_anything() {
         let (_dir, home, sources) = fixture();
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(true, &mut Vec::new())
             .unwrap();
         assert!(!home.exists());
         conflicts(&home);
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(true, &mut Vec::new())
             .unwrap();
@@ -302,19 +320,19 @@ mod tests {
     fn full_preflight_rejects_later_directory_and_bad_backup_ancestors() {
         let (_dir, home, sources) = fixture();
         fs::create_dir_all(home.join("agents/beta.toml")).unwrap();
-        assert!(InstallationPlan::prepare(&home, &sources).is_err());
+        assert!(prepare(&home, &sources).is_err());
         assert!(!home.join("agents/alpha.toml").exists());
         fs::remove_dir(home.join("agents/beta.toml")).unwrap();
         fs::write(home.join("agents/alpha.toml"), "old").unwrap();
         fs::write(home.join("backups"), "blocked").unwrap();
-        assert!(InstallationPlan::prepare(&home, &sources).is_err());
+        assert!(prepare(&home, &sources).is_err());
         assert_eq!(
             fs::read_to_string(home.join("agents/alpha.toml")).unwrap(),
             "old"
         );
         fs::remove_file(home.join("backups")).unwrap();
         symlink("missing", home.join("backups")).unwrap();
-        assert!(InstallationPlan::prepare(&home, &sources).is_err());
+        assert!(prepare(&home, &sources).is_err());
     }
     #[test]
     fn backups_preserve_permissions_links_and_user_configuration() {
@@ -327,7 +345,7 @@ mod tests {
         .unwrap();
         fs::write(home.join("config.toml"), "user config").unwrap();
         fs::write(home.join("agents/custom.toml"), "custom").unwrap();
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(false, &mut Vec::new())
             .unwrap();
@@ -357,7 +375,7 @@ mod tests {
             fs::read_to_string(home.join("agents/custom.toml")).unwrap(),
             "custom"
         );
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(false, &mut Vec::new())
             .unwrap();
@@ -367,15 +385,23 @@ mod tests {
     fn interrupted_backup_never_replaces_and_preserves_completed_backup() {
         let (_dir, home, sources) = fixture();
         conflicts(&home);
-        let result = InstallationPlan::prepare(&home, &sources)
-            .unwrap()
-            .execute_with(false, &mut Vec::new(), |stage, index| {
-                if stage == Stage::Backup && index == 1 {
-                    bail!("injected backup failure");
-                }
-                Ok(())
-            });
+        let mut events = Vec::new();
+        let result =
+            prepare(&home, &sources)
+                .unwrap()
+                .execute_with(false, &mut events, |stage, index| {
+                    if stage == Stage::Backup && index == 1 {
+                        bail!("injected backup failure");
+                    }
+                    Ok(())
+                });
         assert!(result.is_err());
+        assert_eq!(
+            events,
+            vec![InstallationEvent::BackupCreated(
+                backups(&home)[0].canonicalize().unwrap()
+            )]
+        );
         assert_eq!(
             fs::read_to_string(home.join("agents/alpha.toml")).unwrap(),
             "original"
@@ -393,22 +419,31 @@ mod tests {
     fn interrupted_replacement_keeps_targets_and_can_resume() {
         let (_dir, home, sources) = fixture();
         conflicts(&home);
-        let result = InstallationPlan::prepare(&home, &sources)
-            .unwrap()
-            .execute_with(false, &mut Vec::new(), |stage, index| {
-                if stage == Stage::Replace && index == 1 {
-                    bail!("injected rename failure");
-                }
-                Ok(())
-            });
+        let mut events = Vec::new();
+        let result =
+            prepare(&home, &sources)
+                .unwrap()
+                .execute_with(false, &mut events, |stage, index| {
+                    if stage == Stage::Replace && index == 1 {
+                        bail!("injected rename failure");
+                    }
+                    Ok(())
+                });
         assert!(result.is_err());
+        assert_eq!(
+            events,
+            vec![
+                InstallationEvent::BackupCreated(backups(&home)[0].canonicalize().unwrap()),
+                InstallationEvent::Installed("alpha".into()),
+            ]
+        );
         assert_eq!(check_links(&home, &sources).len(), 1);
         assert_eq!(
             fs::read_link(home.join("agents/beta.toml")).unwrap(),
             Path::new("../missing.toml")
         );
         assert!(backups(&home)[0].join("alpha.toml").exists());
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(false, &mut Vec::new())
             .unwrap();
@@ -426,7 +461,7 @@ mod tests {
         let (_dir, home, sources) = fixture();
         fs::create_dir(&home).unwrap();
         symlink(sources[0].1.parent().unwrap(), home.join("agents")).unwrap();
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(false, &mut Vec::new())
             .unwrap();
@@ -449,7 +484,7 @@ mod tests {
         fs::create_dir_all(home.join("agents")).unwrap();
         let original = dir.path().join("absent.toml");
         symlink(&original, home.join("agents/alpha.toml")).unwrap();
-        InstallationPlan::prepare(&home, &sources)
+        prepare(&home, &sources)
             .unwrap()
             .execute(false, &mut Vec::new())
             .unwrap();
@@ -464,11 +499,26 @@ mod tests {
         let (dir, _home, sources) = fixture();
         let blocked = dir.path().join("blocked");
         fs::write(&blocked, "not a directory").unwrap();
-        assert!(InstallationPlan::prepare(&blocked.join("home"), &sources).is_err());
+        assert!(prepare(&blocked.join("home"), &sources).is_err());
         assert_eq!(fs::read_to_string(&blocked).unwrap(), "not a directory");
         let dangling = dir.path().join("dangling");
         symlink("missing", &dangling).unwrap();
-        assert!(InstallationPlan::prepare(&dangling.join("home"), &sources).is_err());
+        assert!(prepare(&dangling.join("home"), &sources).is_err());
         assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn missing_parent_traversal_does_not_create_discarded_source_directories() {
+        let (dir, _home, sources) = fixture();
+        let source_directory = sources[0].1.parent().unwrap();
+        let requested = source_directory.join("discarded/../../new-home");
+        let actual = dir.path().canonicalize().unwrap().join("new-home");
+        let plan = prepare(&requested, &sources).unwrap();
+        plan.execute(false, &mut Vec::new()).unwrap();
+        assert!(!source_directory.join("discarded").exists());
+        assert!(check_links(&actual, &sources).is_empty());
+        for (name, source) in sources {
+            assert_eq!(fs::read_to_string(source).unwrap(), name);
+        }
     }
 }

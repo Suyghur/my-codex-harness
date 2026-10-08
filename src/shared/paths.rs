@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::{
     env,
     ffi::OsString,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -67,6 +67,60 @@ impl Locations {
                 .unwrap_or(Path::new("~/.codex")),
         )
     }
+}
+
+// Existing links retain physical parent semantics. Missing components can be
+// discarded by `..`, but every subsequently existing component is inspected.
+// No directory is created during resolution.
+pub(crate) fn physical_directory(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().context("读取当前目录")?.join(path)
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(resolved) => {
+            if !fs::metadata(&resolved)?.is_dir() {
+                bail!("目录路径不可用：{}", path.display());
+            }
+            return Ok(resolved);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("无法解析目标目录 {}", path.display()));
+        }
+    }
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        let actual = fs::canonicalize(&resolved)
+                            .with_context(|| format!("无法解析目录 {}", resolved.display()))?;
+                        if !fs::metadata(&actual)?.is_dir() {
+                            bail!("目录路径不可用：{}", resolved.display());
+                        }
+                        resolved = actual;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("无法检查目录 {}", resolved.display()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn nonempty_env(name: &str) -> Option<PathBuf> {
