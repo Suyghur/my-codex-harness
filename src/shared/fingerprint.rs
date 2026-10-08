@@ -1,7 +1,12 @@
 //! sha256-json-v3 uses compact serde_json encoding (locked by Cargo.lock).
 //! Dependency upgrades must preserve the fixed byte vectors or change ALGORITHM.
-use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use std::io::{self, Write};
+
+use anyhow::Result;
+use serde::{
+    Serialize, Serializer,
+    ser::{Error, SerializeMap, SerializeSeq, SerializeStruct},
+};
 use sha2::{Digest, Sha256};
 
 use crate::shared::assets::Role;
@@ -12,52 +17,102 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn json(value: &toml::Value) -> Result<Value> {
-    Ok(match value {
-        toml::Value::String(v) => Value::String(v.clone()),
-        toml::Value::Integer(v) => Value::from(*v),
-        toml::Value::Float(v) => {
-            if !v.is_finite() {
-                bail!("清单包含非有限浮点数，无法生成 v3 指纹");
-            }
-            Value::from(*v)
-        }
-        toml::Value::Boolean(v) => Value::Bool(*v),
-        toml::Value::Datetime(v) => Value::String(v.to_string().replace(' ', "T")),
-        toml::Value::Array(v) => Value::Array(v.iter().map(json).collect::<Result<_>>()?),
-        toml::Value::Table(v) => {
-            let mut map = Map::new();
-            for (key, value) in v {
-                map.insert(key.clone(), json(value)?);
-            }
-            Value::Object(map)
-        }
-    })
-}
+// Borrow parsed TOML instead of constructing and sorting a second value tree.
+struct ManifestValue<'a>(&'a toml::Value);
 
-// Explicitly sort recursively, independent of serde_json preserve_order features.
-fn ordered(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries: Vec<_> = map.into_iter().collect();
-            entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            let mut map = Map::new();
-            for (key, value) in entries {
-                map.insert(key, ordered(value));
+impl Serialize for ManifestValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.0 {
+            toml::Value::String(value) => serializer.serialize_str(value),
+            toml::Value::Integer(value) => serializer.serialize_i64(*value),
+            toml::Value::Float(value) => {
+                if !value.is_finite() {
+                    return Err(S::Error::custom("清单包含非有限浮点数，无法生成 v3 指纹"));
+                }
+                serializer.serialize_f64(*value)
             }
-            Value::Object(map)
+            toml::Value::Boolean(value) => serializer.serialize_bool(*value),
+            toml::Value::Datetime(value) => {
+                serializer.serialize_str(&value.to_string().replace(' ', "T"))
+            }
+            toml::Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&ManifestValue(value))?;
+                }
+                sequence.end()
+            }
+            toml::Value::Table(values) => {
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, &ManifestValue(value))?;
+                }
+                map.end()
+            }
         }
-        Value::Array(values) => Value::Array(values.into_iter().map(ordered).collect()),
-        value => value,
     }
 }
 
-pub fn encode(manifest: &toml::Value, roles: &[Role]) -> Result<Vec<u8>> {
-    let mut roles: Vec<_> = roles.iter().collect();
-    roles.sort_by(|a, b| a.name.cmp(&b.name));
-    let value =
-        serde_json::json!({"algorithm": ALGORITHM,"manifest":json(manifest)?,"roles":roles});
-    Ok(serde_json::to_vec(&ordered(value))?)
+// The public Role's declaration order is an output choice, not the v3 key order.
+struct FingerprintRole<'a>(&'a Role);
+
+impl Serialize for FingerprintRole<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let role = self.0;
+        let mut fields = serializer.serialize_struct("Role", 8)?;
+        fields.serialize_field("access", &role.access)?;
+        fields.serialize_field("file", &role.file)?;
+        fields.serialize_field("model", &role.model)?;
+        fields.serialize_field("modes", &role.modes)?;
+        fields.serialize_field("name", &role.name)?;
+        fields.serialize_field("prompt_sha256", &role.prompt_sha256)?;
+        fields.serialize_field("reasoning_effort", &role.reasoning_effort)?;
+        fields.serialize_field("sha256", &role.sha256)?;
+        fields.end()
+    }
+}
+
+#[derive(Serialize)]
+struct Fingerprint<'a> {
+    algorithm: &'static str,
+    manifest: ManifestValue<'a>,
+    roles: Vec<FingerprintRole<'a>>,
+}
+
+fn fingerprint<'a>(manifest: &'a toml::Value, roles: &'a [Role]) -> Fingerprint<'a> {
+    let mut roles: Vec<_> = roles.iter().map(FingerprintRole).collect();
+    roles.sort_by(|a, b| a.0.name.as_bytes().cmp(b.0.name.as_bytes()));
+    Fingerprint {
+        algorithm: ALGORITHM,
+        manifest: ManifestValue(manifest),
+        roles,
+    }
+}
+
+struct HashWriter(Sha256);
+
+impl Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn bundle_digest(manifest: &toml::Value, roles: &[Role]) -> Result<String> {
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &fingerprint(manifest, roles))?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
+#[cfg(test)]
+fn encode(manifest: &toml::Value, roles: &[Role]) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&fingerprint(manifest, roles))?)
 }
 
 #[cfg(test)]
@@ -81,6 +136,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bytes, encode(&reordered, &[]).unwrap());
+        assert_eq!(bundle_digest(&manifest, &[]).unwrap(), digest(&bytes));
     }
     #[test]
     fn role_nulls_are_part_of_the_fixed_vector() {
@@ -96,7 +152,8 @@ mod tests {
             prompt_sha256: "prompt".into(),
         };
         let expected = r#"{"algorithm":"sha256-json-v3","manifest":{"name":"fixture"},"roles":[{"access":"task-scoped","file":"agents/one.toml","model":null,"modes":["custom"],"name":"one","prompt_sha256":"prompt","reasoning_effort":null,"sha256":"file"}]}"#;
-        let bytes = encode(&manifest, &[role]).unwrap();
+        let bytes = encode(&manifest, std::slice::from_ref(&role)).unwrap();
+        assert_eq!(bundle_digest(&manifest, &[role]).unwrap(), digest(&bytes));
         assert_eq!(bytes, expected.as_bytes());
         assert_eq!(
             digest(&bytes),
@@ -117,12 +174,60 @@ mod tests {
     fn nonfinite_is_rejected_at_every_depth() {
         for spelling in ["nan", "inf", "-inf"] {
             let value = toml::from_str(&format!("[metadata]\nvalues=[{spelling}]\n")).unwrap();
-            assert!(
-                encode(&value, &[])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("非有限")
-            );
+            for result in [
+                encode(&value, &[]).map(|_| ()),
+                bundle_digest(&value, &[]).map(|_| ()),
+            ] {
+                assert!(result.unwrap_err().to_string().contains("非有限"));
+            }
         }
+    }
+    #[test]
+    fn numeric_boundaries_and_fractional_dates_have_fixed_bytes_and_hash() {
+        let manifest: toml::Value = toml::from_str(
+            "negative_zero=-0.0\nfloat_min=5e-324\nfloat_max=1.7976931348623157e308\ninteger_min=-9223372036854775808\ninteger_max=9223372036854775807\nlocal=1979-05-27 07:32:00.123456789\noffset=1979-05-27T07:32:00.000000001+08:00\ntime=07:32:00.125\n"
+        ).unwrap();
+        let expected = r#"{"algorithm":"sha256-json-v3","manifest":{"float_max":1.7976931348623157e+308,"float_min":5e-324,"integer_max":9223372036854775807,"integer_min":-9223372036854775808,"local":"1979-05-27T07:32:00.123456789","negative_zero":-0.0,"offset":"1979-05-27T07:32:00.000000001+08:00","time":"07:32:00.125"},"roles":[]}"#;
+        let bytes = encode(&manifest, &[]).unwrap();
+        assert_eq!(bytes, expected.as_bytes());
+        assert_eq!(
+            digest(&bytes),
+            "179665fed1fc70eb02967c3cda224cc923c26d120760ca62f080825b8e3727bf"
+        );
+        assert_eq!(
+            bundle_digest(&manifest, &[]).unwrap(),
+            "179665fed1fc70eb02967c3cda224cc923c26d120760ca62f080825b8e3727bf"
+        );
+    }
+
+    #[test]
+    fn role_order_is_canonical_but_mode_arrays_keep_their_order() {
+        let manifest = toml::from_str("[metadata]\nz=1\na=2\n").unwrap();
+        let role = |name: &str| Role {
+            name: name.into(),
+            file: format!("agents/{name}.toml"),
+            modes: vec!["z".into(), "a".into()],
+            access: "task-scoped".into(),
+            model: Some("model".into()),
+            reasoning_effort: Some("high".into()),
+            sha256: "file".into(),
+            prompt_sha256: "prompt".into(),
+        };
+        let expected = r#"{"algorithm":"sha256-json-v3","manifest":{"metadata":{"a":2,"z":1}},"roles":[{"access":"task-scoped","file":"agents/a.toml","model":"model","modes":["z","a"],"name":"a","prompt_sha256":"prompt","reasoning_effort":"high","sha256":"file"},{"access":"task-scoped","file":"agents/z.toml","model":"model","modes":["z","a"],"name":"z","prompt_sha256":"prompt","reasoning_effort":"high","sha256":"file"}]}"#;
+        let reverse = [role("z"), role("a")];
+        assert_eq!(encode(&manifest, &reverse).unwrap(), expected.as_bytes());
+        assert_eq!(
+            bundle_digest(&manifest, &reverse).unwrap(),
+            "d7dbccfb6bd8b0f8c8583b017031f92afad56fa2e03dfb58b6339ef8e8a8d28a"
+        );
+        assert_eq!(
+            encode(&manifest, &[role("a"), role("z")]).unwrap(),
+            expected.as_bytes()
+        );
+        let reordered = toml::from_str("[metadata]\na=2\nz=1\n").unwrap();
+        assert_eq!(
+            bundle_digest(&reordered, &reverse).unwrap(),
+            "d7dbccfb6bd8b0f8c8583b017031f92afad56fa2e03dfb58b6339ef8e8a8d28a"
+        );
     }
 }

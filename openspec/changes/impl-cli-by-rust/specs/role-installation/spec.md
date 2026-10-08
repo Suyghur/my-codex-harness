@@ -9,6 +9,31 @@
 ### Requirement: 安装预检与平台范围
 install SHALL 仅支持 macOS/Linux，并在创建安装目录或替换角色前校验全部资产、目标目录祖先、全部目标文件类型及必要备份目录。目标只允许普通文件或符号链接；已有目标目录或不可用目录祖先 MUST 导致失败且不产生安装写入。
 
+install MUST 在只读预检中拒绝忽略 ASCII 大小写后重复的目标名称，采用一致的可移植策略，不依赖目标卷是否区分大小写。实际写入目录 SHALL 解析现有祖先的物理路径，固定解析后的路径用于执行；安装或备份写入位于物理源 agents 内，以及目标替换会覆盖资产清单时 MUST 被拒绝。目标已经全部正确且无需任何写入时 SHALL 保留幂等跳过。
+
+`check --codex-home` SHALL 与 install 共用物理目录解析规则；包含不存在路径段与 `..` 的参数在安装和检查之间 MUST 保持一致，且不创建被规整掉的目录。
+
+#### Scenario: 安装与检查的目录解析一致
+- **WHEN** 使用相同的 missing/../home 目标参数执行 dry-run、install 和 check
+- **THEN** 正式安装后 check 通过，预览和正式安装均不创建 missing 目录
+
+#### Scenario: 缺失段之后的目录链接与不可用祖先
+- **WHEN** 目标路径包含 missing/../alias/../home，alias 指向既有 remote/sub 目录
+- **THEN** 预览、安装和检查使用 remote/home，既有链接后的父目录保持物理语义，missing 不被创建
+- **AND** 若该位置是普通文件或断链，则预览与安装均失败且不产生写入
+
+#### Scenario: 大小写目标碰撞
+- **WHEN** Alpha 与 alpha 分别来自不同合法源目录，用户执行 install 或 dry-run
+- **THEN** 在任何支持平台均返回失败且不写入目标或源资产，即使目标目录链接到其中一个源目录
+
+#### Scenario: 子目录源角色与安装目录别名
+- **WHEN** 角色登记 agents/nested/worker.toml，目标 agents 链接到源 agents
+- **THEN** install 与 dry-run 均拒绝向源目录创建新目标，源文件集合和内容不变
+
+#### Scenario: 备份或清单写入重叠
+- **WHEN** 必需备份目录解析到源 agents 内，或某角色目标替换会覆盖 harness.toml
+- **THEN** 安装预检失败，不创建安装目录、备份或角色链接，不修改原清单与冲突目标
+
 #### Scenario: 后续角色存在冲突目录
 - **WHEN** 一个登记角色目标是目录，其他目标均可安装
 - **THEN** 整次预检失败，其他角色不被提前安装
@@ -34,6 +59,10 @@ install SHALL 通过同一文件系统内的临时链接原子替换每个目标
 #### Scenario: 替换中断
 - **WHEN** 部分链接已完成而下一次替换失败
 - **THEN** 返回操作失败，已安装链接与备份可检查，未完成目标不被先删除
+
+#### Scenario: 结果输出失败
+- **WHEN** 文件系统安装成功，但结果输出管道不可写
+- **THEN** 程序返回操作失败，输出错误不提前中断角色安装；文件系统失败时仍保留并尝试报告备份路径和已完成动作
 
 ### Requirement: 幂等与用户配置保护
 install SHALL 跳过已解析到正确源文件的目标，不创建无必要备份，仅处理清单登记角色，不修改 config.toml、清单外角色或源资产。`check --codex-home` SHALL 检查每个登记目标是否解析到正确源文件并报告缺失或错误目标。

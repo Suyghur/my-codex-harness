@@ -1,4 +1,5 @@
 use crate::shared::fingerprint;
+use crate::shared::role_name::validate_role_name;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,15 +31,15 @@ pub struct Role {
 pub struct AssetSet {
     pub bundle: Bundle,
     pub sources: Vec<(String, PathBuf)>,
+    pub agents_boundary: PathBuf,
+    pub manifest_source: PathBuf,
 }
-#[derive(Deserialize)]
 struct Manifest {
     schema_version: u32,
     name: String,
     version: String,
     roles: BTreeMap<String, Route>,
 }
-#[derive(Deserialize)]
 struct Route {
     file: String,
     modes: Vec<String>,
@@ -52,16 +53,81 @@ struct Definition {
     model: Option<String>,
     model_reasoning_effort: Option<String>,
 }
+impl Manifest {
+    // toml::Value only offers an owned Deserializer. Borrow the parsed tree
+    // here so unknown metadata need not be cloned or parsed a second time.
+    fn from_value(value: &toml::Value) -> Result<Self> {
+        fn string(table: &toml::Table, key: &str) -> Result<String> {
+            table
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| format!("{key} 必须为字符串"))
+        }
+        let table = value.as_table().context("清单必须为表")?;
+        let schema_version = table
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u32::try_from(value).ok())
+            .context("schema_version 必须为非负 u32 整数")?;
+        let entries = table
+            .get("roles")
+            .and_then(toml::Value::as_table)
+            .context("roles 必须为表")?;
+        let mut roles = BTreeMap::new();
+        for (name, value) in entries {
+            let route = (|| -> Result<Route> {
+                let table = value.as_table().context("角色路由必须为表")?;
+                let modes = table
+                    .get("modes")
+                    .and_then(toml::Value::as_array)
+                    .context("modes 必须为数组")?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("mode 必须为字符串")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Route {
+                    file: string(table, "file")?,
+                    modes,
+                    access: string(table, "access")?,
+                })
+            })()
+            .with_context(|| format!("角色 {name} 路由字段无效"))?;
+            roles.insert(name.clone(), route);
+        }
+        Ok(Self {
+            schema_version,
+            name: string(table, "name")?,
+            version: string(table, "version")?,
+            roles,
+        })
+    }
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| format!("读取 {label} 文件类型失败"))?;
+    ensure!(metadata.is_file(), "{label} 必须为普通文件");
+    Ok(())
+}
+
 fn nonblank(value: &str, field: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{field} 不能为空白");
     Ok(())
 }
 impl AssetSet {
     pub fn load(root: &Path) -> Result<Self> {
-        let text =
-            fs::read_to_string(root.join("harness.toml")).context("读取 harness.toml 失败")?;
+        let manifest_source = root
+            .join("harness.toml")
+            .canonicalize()
+            .context("解析 harness.toml 路径失败")?;
+        ensure_regular_file(&manifest_source, "harness.toml")?;
+        let text = fs::read_to_string(&manifest_source).context("读取 harness.toml 失败")?;
         let full: toml::Value = toml::from_str(&text).context("解析 harness.toml 失败")?;
-        let manifest: Manifest = toml::from_str(&text).context("清单字段无效")?;
+        let manifest = Manifest::from_value(&full).context("清单字段无效")?;
         ensure!(manifest.schema_version == 1, "不支持的 schema_version");
         nonblank(&manifest.name, "清单 name")?;
         nonblank(&manifest.version, "清单 version")?;
@@ -76,7 +142,7 @@ impl AssetSet {
         let mut sources = Vec::new();
         let mut roles = Vec::new();
         for (name, route) in manifest.roles {
-            nonblank(&name, "角色 name")?;
+            validate_role_name(&name)?;
             let path = Path::new(&route.file);
             ensure!(
                 !path.is_absolute()
@@ -144,7 +210,7 @@ impl AssetSet {
                     nonblank(value, &format!("角色 {name} {field}"))?;
                 }
             }
-            registered_files.insert(root.join(path));
+            registered_files.insert((name.clone(), source.clone()));
             roles.push(Role {
                 name: name.clone(),
                 file: route.file,
@@ -160,14 +226,21 @@ impl AssetSet {
         for entry in fs::read_dir(root.join("agents"))? {
             let path = entry?.path();
             if path.extension().is_some_and(|v| v == "toml") {
+                let actual = path
+                    .canonicalize()
+                    .with_context(|| format!("解析直属角色文件 {} 失败", path.display()))?;
+                if actual.is_dir() {
+                    continue;
+                }
+                let name = path.file_stem().and_then(|v| v.to_str());
                 ensure!(
-                    registered_files.contains(&path),
+                    name.is_some_and(|name| registered_files.contains(&(name.to_owned(), actual))),
                     "未登记角色文件 {}",
                     path.display()
                 );
             }
         }
-        let fingerprint = fingerprint::digest(&fingerprint::encode(&full, &roles)?);
+        let fingerprint = fingerprint::bundle_digest(&full, &roles)?;
         Ok(Self {
             bundle: Bundle {
                 name: manifest.name,
@@ -178,6 +251,8 @@ impl AssetSet {
                 roles,
             },
             sources,
+            agents_boundary: boundary,
+            manifest_source,
         })
     }
 
@@ -197,28 +272,40 @@ impl AssetSet {
             task: String,
             criteria: Vec<String>,
         }
-        let catalog: Catalog = serde_json::from_slice(
-            &fs::read(root.join("evals/scenarios.json")).context("读取场景目录失败")?,
-        )
-        .context("解析场景目录失败")?;
+        let path = root.join("evals/scenarios.json");
+        ensure_regular_file(&path, "scenarios.json")?;
+        let catalog: Catalog =
+            serde_json::from_slice(&fs::read(&path).context("读取场景目录失败")?)
+                .context("解析场景目录失败")?;
         ensure!(
             catalog.schema_version == 1 && catalog.status == "seed_not_run",
             "场景 schema_version 或 status 无效"
         );
         ensure!(!catalog.scenarios.is_empty(), "场景目录不能为空");
+        let role_modes: BTreeMap<&str, BTreeSet<&str>> = self
+            .bundle
+            .roles
+            .iter()
+            .map(|role| {
+                (
+                    role.name.as_str(),
+                    role.modes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
         let mut ids = BTreeSet::new();
-        for scenario in catalog.scenarios {
+        for scenario in &catalog.scenarios {
             nonblank(&scenario.id, "场景 id")?;
             ensure!(
-                ids.insert(scenario.id.clone()),
+                ids.insert(scenario.id.as_str()),
                 "场景 {} id 重复",
                 scenario.id
             );
-            let Some(role) = self.bundle.roles.iter().find(|v| v.name == scenario.role) else {
+            let Some(modes) = role_modes.get(scenario.role.as_str()) else {
                 bail!("场景 {} 角色无效", scenario.id)
             };
             ensure!(
-                role.modes.contains(&scenario.mode),
+                modes.contains(scenario.mode.as_str()),
                 "场景 {} 模式无效",
                 scenario.id
             );
@@ -229,8 +316,8 @@ impl AssetSet {
                 "场景 {} criteria 不能为空",
                 scenario.id
             );
-            for criterion in scenario.criteria {
-                nonblank(&criterion, &format!("场景 {} criteria", scenario.id))?;
+            for criterion in &scenario.criteria {
+                nonblank(criterion, &format!("场景 {} criteria", scenario.id))?;
             }
         }
         Ok(())
@@ -311,6 +398,105 @@ mod tests {
         assert!(AssetSet::load(dir.path()).is_err());
     }
     #[test]
+    fn parsed_manifest_projection_preserves_field_type_validation() {
+        for (before, after) in [
+            ("schema_version=1", "schema_version=-1"),
+            ("schema_version=1", "schema_version=4294967296"),
+            ("schema_version=1", "schema_version='1'"),
+            ("name='fixture'", "name=1"),
+            ("version='1'", "version=true"),
+            ("[roles.one]", "[roles]\none='invalid'\n[other]"),
+            ("file='agents/one.toml'", "file=1"),
+            ("modes=['custom']", "modes='custom'"),
+            ("modes=['custom']", "modes=[1]"),
+            ("access='task-scoped'", "access=false"),
+            ("access='task-scoped'", ""),
+        ] {
+            let dir = fixture();
+            let path = dir.path().join("harness.toml");
+            let text = fs::read_to_string(&path).unwrap();
+            fs::write(path, text.replace(before, after)).unwrap();
+            let error = AssetSet::load(dir.path()).err().unwrap();
+            assert!(
+                error.to_string().contains("清单字段无效"),
+                "accepted or misclassified {after:?}: {error:#}"
+            );
+        }
+    }
+    #[test]
+    fn toml_directories_are_not_unregistered_role_files() {
+        let dir = fixture();
+        let group = dir.path().join("agents/group.toml");
+        fs::create_dir(&group).unwrap();
+        fs::rename(dir.path().join("agents/one.toml"), group.join("one.toml")).unwrap();
+        let manifest = dir.path().join("harness.toml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        fs::write(
+            manifest,
+            text.replace("agents/one.toml", "agents/group.toml/one.toml"),
+        )
+        .unwrap();
+        AssetSet::load(dir.path()).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("group.toml", dir.path().join("agents/alias.toml")).unwrap();
+            AssetSet::load(dir.path()).unwrap();
+        }
+        let extra = dir.path().join("agents/extra.toml");
+        fs::write(&extra, "").unwrap();
+        assert!(
+            AssetSet::load(dir.path())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("未登记角色文件")
+        );
+        #[cfg(unix)]
+        {
+            fs::remove_file(&extra).unwrap();
+            std::os::unix::fs::symlink("missing.toml", &extra).unwrap();
+            assert!(
+                AssetSet::load(dir.path())
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("解析直属角色文件")
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_manifest_and_scenario_inputs_are_rejected() {
+        let dir = fixture();
+        let asset = AssetSet::load(dir.path()).unwrap();
+        fs::create_dir(dir.path().join("evals")).unwrap();
+        for (relative, label) in [
+            ("harness.toml", "harness.toml"),
+            ("evals/scenarios.json", "scenarios.json"),
+        ] {
+            let path = dir.path().join(relative);
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            fs::create_dir(&path).unwrap();
+            ensure_regular_file(&path, label).unwrap_err();
+            fs::remove_dir(&path).unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let error = if label == "harness.toml" {
+                AssetSet::load(dir.path()).err().unwrap()
+            } else {
+                asset.validate_scenarios(dir.path()).unwrap_err()
+            };
+            assert!(error.to_string().contains("必须为普通文件"), "{error:#}");
+        }
+    }
+    #[test]
     fn missing_blank_and_mismatched_fields_are_rejected() {
         for (before, after) in [
             ("name='fixture'", "name=' '"),
@@ -349,6 +535,69 @@ mod tests {
             .unwrap();
             assert!(AssetSet::load(dir.path()).is_err(), "accepted {after:?}");
         }
+    }
+    #[test]
+    fn asset_role_names_use_the_portable_ascii_contract() {
+        for name in [".", "..", "one\\two", "角色", "réader"] {
+            let dir = fixture();
+            let manifest = format!(
+                "schema_version=1\nname='fixture'\nversion='1'\n[roles.'{name}']\nfile='agents/{name}.toml'\nmodes=['custom']\naccess='task-scoped'\n"
+            );
+            fs::write(dir.path().join("harness.toml"), manifest).unwrap();
+            let error = AssetSet::load(dir.path()).err().unwrap();
+            assert!(error.to_string().contains("非法角色名称"), "{error:#}");
+        }
+        let dir = fixture();
+        let name = "Reader_2-X";
+        fs::rename(
+            dir.path().join("agents/one.toml"),
+            dir.path().join(format!("agents/{name}.toml")),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(format!("agents/{name}.toml")),
+            format!("name='{name}'\ndescription='valid'\ndeveloper_instructions='valid'\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("harness.toml"),
+            format!("schema_version=1\nname='fixture'\nversion='1'\n[roles.{name}]\nfile='agents/{name}.toml'\nmodes=['custom']\naccess='task-scoped'\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            AssetSet::load(dir.path()).unwrap().bundle.roles[0].name,
+            name
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn registered_alias_matches_the_direct_source_but_not_other_role_names() {
+        let dir = fixture();
+        fs::create_dir(dir.path().join("links")).unwrap();
+        std::os::unix::fs::symlink("../agents/one.toml", dir.path().join("links/one.toml"))
+            .unwrap();
+        let manifest = dir.path().join("harness.toml");
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest)
+                .unwrap()
+                .replace("file='agents/one.toml'", "file='links/one.toml'"),
+        )
+        .unwrap();
+        let assets = AssetSet::load(dir.path()).unwrap();
+        assert_eq!(
+            assets.agents_boundary,
+            dir.path().join("agents").canonicalize().unwrap()
+        );
+        assert_eq!(assets.manifest_source, manifest.canonicalize().unwrap());
+        std::os::unix::fs::symlink("one.toml", dir.path().join("agents/extra.toml")).unwrap();
+        assert!(
+            AssetSet::load(dir.path())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("未登记角色文件")
+        );
     }
     #[cfg(unix)]
     #[test]

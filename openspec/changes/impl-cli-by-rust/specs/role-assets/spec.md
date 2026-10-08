@@ -9,6 +9,21 @@
 ### Requirement: 清单和角色有效性
 资产检查 SHALL 校验 schema_version=1、非空名称和版本、至少一个角色、角色名与文件名及 TOML name 一致、非空描述和提示词、至少一个非空白且不重复的 mode、已支持的 access；模式名 MUST 不受固定名称列表限制。可选模型和推理设置 MUST 为非空字符串。登记角色源路径 SHALL 唯一，agents 直属 TOML 文件 SHALL 全部登记。
 
+角色名称 SHALL 使用至少一个 ASCII 字母、数字、下划线或连字符，资产加载与安装 MUST 使用同一验证规则。直属文件登记 SHALL 以物理来源和角色名判定，允许仓库内路径别名指向已登记的真实源，不将不同名称的额外链接误认为已登记。
+
+#### Scenario: 不可移植角色名
+- **WHEN** 角色名称包含点名、路径分隔符或非 ASCII 字符
+- **THEN** check 与 install 均在资产加载时拒绝该名称，install 不产生写入
+
+#### Scenario: 合法登记路径别名
+- **WHEN** 登记 links/one.toml 链接到 agents/one.toml，文件和角色名一致且物理来源有效
+- **THEN** check 接受该登记，install 可将目标链接到真实源；额外不同角色名的直属 TOML 链接仍被拒绝
+
+#### Scenario: TOML 后缀目录与非普通输入文件
+- **WHEN** 合法角色登记在 agents/group.toml/one.toml，group.toml 为目录
+- **THEN** 该目录不作为未登记角色文件拒绝，其他角色检查继续生效
+- **AND** harness.toml 或需要检查的 evals/scenarios.json 为 FIFO 等非普通文件时，检查及时失败，不等待文件内容；JSON 返回结构化错误
+
 #### Scenario: 非法角色和清单
 - **WHEN** 清单 schema 不受支持、模式重复、access 无效、模型为数字或空白、角色名称不匹配，或存在未登记 TOML
 - **THEN** 资产检查失败并指出受影响的资产，不返回通过结果
